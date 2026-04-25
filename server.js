@@ -44,6 +44,7 @@ app.get("/health", (_, res) => {
 
 const ChatSchema = z.object({
   message: z.string().min(1).max(1200),
+  intent_mode: z.enum(["tutor_css", "guia_juego", "auto"]).optional(),
   player_context: z
     .object({
       screen: z.string().optional(), // ej: bullet_creator
@@ -56,11 +57,11 @@ const ChatSchema = z.object({
   conversation_id: z.string().max(120).optional(),
 });
 
-function buildSystemPrompt() {
+function buildSystemPromptTutorCSS() {
   return `
 Eres Emis, asistente CSS de un videojuego.
 Personalidad: semisarcástico, elocuente, estilo Jarvis, jamás ofensivo.
-Objetivo: enseñar CSS de forma breve, útil y accionable.
+Objetivo: tutorizar CSS de forma breve, útil y accionable.
 Formato de respuesta:
 1) Diagnóstico rápido
 2) Sugerencia CSS (snippet corto)
@@ -72,6 +73,70 @@ Reglas:
 - No inventes APIs ni mecánicas que no se hayan dicho.
 - Máximo 180 palabras.
 `.trim();
+}
+
+function buildSystemPromptGuiaJuego() {
+  return `
+Eres Emis, guía dentro de un videojuego educativo de CSS.
+Personalidad: semisarcástico, elocuente, estilo Jarvis, jamás ofensivo.
+Objetivo: orientar progreso del jugador dentro del mundo y destrabar su siguiente acción.
+Formato de respuesta:
+1) Estado/objetivo actual (muy corto)
+2) Qué hacer ahora (paso concreto)
+3) Señal o pista para validar avance
+Reglas:
+- Prioriza navegación, misión, nivel y portales por encima de teoría extensa.
+- Evita explicaciones largas de CSS salvo que el jugador lo pida explícitamente.
+- Si falta contexto, pregunta 1 cosa puntual.
+- No inventes zonas, NPCs, APIs ni mecánicas no mencionadas.
+- Máximo 140 palabras.
+`.trim();
+}
+
+const CSS_INTENT_TERMS = [
+  "display",
+  "flex",
+  "grid",
+  "selector",
+  "padding",
+  "margin",
+  "color",
+  "position",
+  "class",
+  "id",
+  "css",
+];
+
+const GAME_INTENT_TERMS = [
+  "dónde",
+  "donde",
+  "mision",
+  "misión",
+  "portal",
+  "nivel",
+  "objetivo",
+  "progreso",
+  "mapa",
+  "ir a",
+];
+
+function resolveIntentMode(intentMode, message) {
+  if (intentMode === "tutor_css" || intentMode === "guia_juego") {
+    return intentMode;
+  }
+
+  const normalizedMessage = message.toLowerCase();
+  const hasCssTerms = CSS_INTENT_TERMS.some((term) =>
+    normalizedMessage.includes(term),
+  );
+  if (hasCssTerms) return "tutor_css";
+
+  const hasGameTerms = GAME_INTENT_TERMS.some((term) =>
+    normalizedMessage.includes(term),
+  );
+  if (hasGameTerms) return "guia_juego";
+
+  return "tutor_css";
 }
 
 app.post("/api/emis/chat", async (req, res) => {
@@ -87,7 +152,12 @@ app.post("/api/emis/chat", async (req, res) => {
         });
     }
 
-    const { message, player_context, css_snapshot } = parsed.data;
+    const { message, player_context, css_snapshot, intent_mode } = parsed.data;
+    const mode_used = resolveIntentMode(intent_mode ?? "auto", message);
+    const systemPrompt =
+      mode_used === "guia_juego"
+        ? buildSystemPromptGuiaJuego()
+        : buildSystemPromptTutorCSS();
 
     const prompt = `
 [CONTEXTO JUGADOR]
@@ -105,7 +175,7 @@ ${message}
       contents: [
         {
           role: "user",
-          parts: [{ text: `${buildSystemPrompt()}\n\n${prompt}` }],
+          parts: [{ text: `${systemPrompt}\n\n${prompt}` }],
         },
       ],
       config: {
@@ -120,7 +190,7 @@ ${message}
     const reply =
       response?.text?.trim() ||
       "No pude responder ahora mismo. Intenta otra vez.";
-    return res.json({ ok: true, reply });
+    return res.json({ ok: true, reply, mode_used });
   } catch (err) {
     console.error(err);
     return res
