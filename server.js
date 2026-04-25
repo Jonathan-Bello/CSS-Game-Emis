@@ -78,6 +78,13 @@ const ChatSchema = z.object({
       level: z.string().optional(), // ej: nivel_2
       objective: z.string().optional(), // ej: crear bala con más daño
       unlocked_css: z.array(z.string()).optional(),
+      zone_id: z.string().max(120).optional(),
+      quest_id: z.string().max(120).optional(),
+      quest_step: z.string().max(120).optional(),
+      nearby_npcs: z.array(z.string().max(120)).max(20).optional(),
+      available_portals: z.array(z.string().max(120)).max(20).optional(),
+      inventory_tags: z.array(z.string().max(120)).max(40).optional(),
+      failed_attempts_css: z.array(z.string().max(120)).max(30).optional(),
     })
     .optional(),
   css_snapshot: z.string().max(10000).optional(),
@@ -89,7 +96,13 @@ function buildSystemPromptTutorCSS() {
 Eres Emis, asistente CSS de un videojuego.
 Personalidad: semisarcástico, elocuente, estilo Jarvis, jamás ofensivo.
 Objetivo: tutorizar CSS de forma breve, útil y accionable.
-Formato de respuesta:
+Formato de salida:
+- Devuelve ÚNICAMENTE JSON válido con esta forma exacta:
+{
+  "reply": "texto para el jugador",
+  "suggested_action_code": "CODIGO_ACCION_EN_MAYUSCULAS"
+}
+Formato de "reply":
 1) Diagnóstico rápido
 2) Sugerencia CSS (snippet corto)
 3) Por qué funciona
@@ -98,6 +111,7 @@ Reglas:
 - Prioriza propiedades simples y entendibles.
 - Si falta contexto, pregunta 1 cosa puntual.
 - No inventes APIs ni mecánicas que no se hayan dicho.
+- Solo puedes recomendar rutas/mecánicas presentes en game_context.
 - Máximo 180 palabras.
 `.trim();
 }
@@ -107,7 +121,13 @@ function buildSystemPromptGuiaJuego() {
 Eres Emis, guía dentro de un videojuego educativo de CSS.
 Personalidad: semisarcástico, elocuente, estilo Jarvis, jamás ofensivo.
 Objetivo: orientar progreso del jugador dentro del mundo y destrabar su siguiente acción.
-Formato de respuesta:
+Formato de salida:
+- Devuelve ÚNICAMENTE JSON válido con esta forma exacta:
+{
+  "reply": "texto para el jugador",
+  "suggested_action_code": "CODIGO_ACCION_EN_MAYUSCULAS"
+}
+Formato de "reply":
 1) Estado/objetivo actual (muy corto)
 2) Qué hacer ahora (paso concreto)
 3) Señal o pista para validar avance
@@ -116,6 +136,7 @@ Reglas:
 - Evita explicaciones largas de CSS salvo que el jugador lo pida explícitamente.
 - Si falta contexto, pregunta 1 cosa puntual.
 - No inventes zonas, NPCs, APIs ni mecánicas no mencionadas.
+- Solo puedes recomendar rutas/mecánicas presentes en game_context.
 - Máximo 140 palabras.
 `.trim();
 }
@@ -219,7 +240,42 @@ function compressPlayerContext(playerContext) {
   return {
     ...playerContext,
     unlocked_css: uniqStrings(playerContext.unlocked_css || []),
+    nearby_npcs: uniqStrings(playerContext.nearby_npcs || []),
+    available_portals: uniqStrings(playerContext.available_portals || []),
+    inventory_tags: uniqStrings(playerContext.inventory_tags || []),
+    failed_attempts_css: uniqStrings(playerContext.failed_attempts_css || []),
   };
+}
+
+function parseModelReply(rawText = "") {
+  const cleaned = String(rawText).trim().replace(/```json|```/g, "").trim();
+  if (!cleaned) {
+    return {
+      reply: "No pude responder ahora mismo. Intenta otra vez.",
+      suggested_action_code: "RETRY_REQUEST",
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    const reply = String(parsed?.reply || "").trim();
+    const suggested_action_code = String(parsed?.suggested_action_code || "")
+      .trim()
+      .toUpperCase()
+      .replace(/\s+/g, "_")
+      .slice(0, 80);
+
+    if (!reply) throw new Error("reply vacío");
+    return {
+      reply,
+      suggested_action_code: suggested_action_code || "FOLLOW_GUIDANCE",
+    };
+  } catch {
+    return {
+      reply: cleaned.slice(0, 1000),
+      suggested_action_code: "FOLLOW_GUIDANCE",
+    };
+  }
 }
 
 function compactCssText(text, maxLen = 1600) {
@@ -478,6 +534,7 @@ app.post("/api/emis/chat", async (req, res) => {
       return res.json({
         ok: true,
         reply: ultraBriefReply,
+        suggested_action_code: "REFINE_QUESTION",
         mode_used: "ultra_brief_budget",
         conversation_id,
       });
@@ -502,6 +559,28 @@ app.post("/api/emis/chat", async (req, res) => {
         .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
         .join("\n") || "(sin historial reciente)";
 
+    const gameContext = compressedPlayerContext || {};
+    if (mode_used === "guia_juego" && (!gameContext.quest_id || !gameContext.quest_step)) {
+      const clarificationReply =
+        "Para guiarte bien, dime tu quest_id y quest_step actuales.";
+      const estimatedOutputTokens = estimateTokens(clarificationReply);
+      registerTokenUsage(state, estimateTokens(message) + estimatedOutputTokens);
+
+      state.recent_messages.push({ role: "user", text: message });
+      state.recent_messages.push({ role: "assistant", text: clarificationReply });
+      state.recent_messages = state.recent_messages.slice(-MAX_RECENT_MESSAGES);
+      state.turn_count += 1;
+      state.last_activity_at = Date.now();
+
+      return res.json({
+        ok: true,
+        reply: clarificationReply,
+        suggested_action_code: "PROVIDE_QUEST_CONTEXT",
+        mode_used,
+        conversation_id,
+      });
+    }
+
     const prompt = `
 [RESUMEN ACUMULADO]
 ${state.running_summary || "(sin resumen todavía)"}
@@ -509,8 +588,8 @@ ${state.running_summary || "(sin resumen todavía)"}
 [ÚLTIMOS TURNOS]
 ${recentTurnsText}
 
-[CONTEXTO JUGADOR]
-${JSON.stringify(compressedPlayerContext || {}, null, 2)}
+[GAME CONTEXT]
+${JSON.stringify(gameContext, null, 2)}
 
 [PERFIL DEL JUGADOR]
 ${JSON.stringify(updatedPlayerProfile, null, 2)}
@@ -551,9 +630,7 @@ ${message}
       },
     });
 
-    const reply =
-      response?.text?.trim() ||
-      "No pude responder ahora mismo. Intenta otra vez.";
+    const { reply, suggested_action_code } = parseModelReply(response?.text || "");
     const estimatedOutputTokens = estimateTokens(reply);
     registerTokenUsage(state, estimatedInputTokens + estimatedOutputTokens);
 
@@ -583,7 +660,13 @@ ${message}
       }),
     );
 
-    return res.json({ ok: true, reply, mode_used, conversation_id });
+    return res.json({
+      ok: true,
+      reply,
+      suggested_action_code,
+      mode_used,
+      conversation_id,
+    });
   } catch (err) {
     console.error(err);
     return res
