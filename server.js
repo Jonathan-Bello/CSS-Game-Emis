@@ -25,6 +25,33 @@ const MAX_SUMMARY_CHARS = 1200;
 const TOKEN_BUDGET_10M = 5000;
 const TOKEN_BUDGET_DAY = 30000;
 const NEAR_BUDGET_THRESHOLD = 0.9;
+const MAX_CSS_BLOCK_LENGTH = 500;
+const MAX_SANITIZED_CSS_LENGTH = 2500;
+const MAX_REPLY_LENGTH = 1100;
+const SECURITY_NEUTRAL_REPLY =
+  "No puedo ayudar con esa solicitud. Si quieres, pregúntame algo de CSS (selector, propiedad, layout) o sobre tu progreso actual en el juego.";
+const JAILBREAK_PATTERNS = [
+  /ignora(?:r)?\s+(?:las?\s+)?reglas?/i,
+  /revela(?:r)?\s+(?:el\s+)?prompt/i,
+  /act[úu]a\s+como\s+sistema/i,
+  /ignore\s+(?:all\s+)?rules?/i,
+  /reveal\s+(?:the\s+)?prompt/i,
+  /act\s+as\s+system/i,
+];
+const OUT_OF_SCOPE_PATTERNS = [
+  /hack(?:ear|ing)?/i,
+  /malware/i,
+  /phishing/i,
+  /fraude/i,
+  /bypass/i,
+  /tarjeta\s+de\s+cr[eé]dito/i,
+];
+const NON_CSS_LINE_PATTERNS = [
+  /^\s*</, // HTML/XML
+  /^\s*(?:https?:\/\/|www\.)/i,
+  /^\s*(?:SELECT|INSERT|UPDATE|DELETE|DROP)\b/i,
+  /^\s*(?:function|const|let|var)\b/i,
+];
 
 /**
  * conversationMemory guarda estado ligero por conversación para ahorrar tokens.
@@ -43,6 +70,8 @@ const NEAR_BUDGET_THRESHOLD = 0.9;
  * }
  */
 const conversationMemory = new Map();
+const securityEventCountersByIp = new Map();
+const securityEventCountersByConversation = new Map();
 
 app.use(helmet());
 app.use(express.json({ limit: "1mb" }));
@@ -284,6 +313,98 @@ function compactCssText(text, maxLen = 1600) {
   return `${text.slice(0, maxLen)}\n/* ...css truncado para ahorrar tokens... */`;
 }
 
+function detectJailbreakAttempt(message = "") {
+  const normalized = String(message);
+  const matchedPattern = JAILBREAK_PATTERNS.find((pattern) =>
+    pattern.test(normalized),
+  );
+  return {
+    isJailbreak: Boolean(matchedPattern),
+    matchedPattern: matchedPattern ? String(matchedPattern) : null,
+  };
+}
+
+function sanitizeCssSnapshot(cssSnapshot = "") {
+  if (!cssSnapshot) return "";
+  const cssText = String(cssSnapshot);
+  const cleanedLines = cssText
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return false;
+      const matchesNonCss = NON_CSS_LINE_PATTERNS.some((pattern) =>
+        pattern.test(trimmed),
+      );
+      return !matchesNonCss;
+    });
+
+  const cleanedText = cleanedLines.join("\n");
+  const blockMatches = Array.from(cleanedText.matchAll(/([^{}]+)\{([^{}]*)\}/g));
+  if (!blockMatches.length) {
+    return compactCssText(cleanedText, Math.min(MAX_SANITIZED_CSS_LENGTH, 1200));
+  }
+
+  const sanitizedBlocks = blockMatches.map((match) => {
+    const selector = String(match[1] || "").trim().slice(0, 120);
+    const body = String(match[2] || "").trim().slice(0, MAX_CSS_BLOCK_LENGTH);
+    return `${selector} {\n${body}\n}`;
+  });
+
+  return compactCssText(
+    sanitizedBlocks.join("\n\n"),
+    MAX_SANITIZED_CSS_LENGTH,
+  );
+}
+
+function postFilterReply(reply = "", mode = "tutor_css") {
+  const normalizedReply = String(reply || "").trim();
+  const tooLong = normalizedReply.length > MAX_REPLY_LENGTH;
+  const hasOutOfScopeContent = OUT_OF_SCOPE_PATTERNS.some((pattern) =>
+    pattern.test(normalizedReply),
+  );
+  const hasPromptLeak = /system prompt|prompt interno|instrucciones internas/i.test(
+    normalizedReply,
+  );
+
+  const lacksRoleAlignment =
+    mode === "tutor_css"
+      ? !/(css|selector|propiedad|layout|estilo|clase|id)/i.test(normalizedReply)
+      : !/(quest|misi[oó]n|nivel|portal|objetivo|progreso|mapa)/i.test(
+          normalizedReply,
+        );
+
+  const blocked = tooLong || hasOutOfScopeContent || hasPromptLeak || lacksRoleAlignment;
+  return {
+    blocked,
+    tooLong,
+    hasOutOfScopeContent,
+    hasPromptLeak,
+    lacksRoleAlignment,
+    sanitizedReply: tooLong ? normalizedReply.slice(0, MAX_REPLY_LENGTH) : normalizedReply,
+  };
+}
+
+function registerSecurityEvent({ ip, conversationId, event, details = {} }) {
+  const nextIpCount = (securityEventCountersByIp.get(ip) || 0) + 1;
+  securityEventCountersByIp.set(ip, nextIpCount);
+  const nextConversationCount =
+    (securityEventCountersByConversation.get(conversationId) || 0) + 1;
+  securityEventCountersByConversation.set(conversationId, nextConversationCount);
+
+  console.warn(
+    JSON.stringify({
+      event: "emis_security_event",
+      security_event_type: event,
+      ip,
+      conversation_id: conversationId,
+      ip_event_count: nextIpCount,
+      conversation_event_count: nextConversationCount,
+      details,
+    }),
+  );
+}
+
 function compressCssSnapshot(cssSnapshot, playerContext, message, state) {
   if (!cssSnapshot) return "";
 
@@ -494,9 +615,30 @@ app.post("/api/emis/chat", async (req, res) => {
     }
 
     const { message, player_context, css_snapshot, intent_mode } = parsed.data;
+    const requestIp = String(req.ip || req.headers["x-forwarded-for"] || "unknown");
     const conversation_id =
       parsed.data.conversation_id?.trim() || crypto.randomUUID();
     const state = getOrCreateConversationState(conversation_id);
+    const jailbreakDetection = detectJailbreakAttempt(message);
+    if (jailbreakDetection.isJailbreak) {
+      registerSecurityEvent({
+        ip: requestIp,
+        conversationId: conversation_id,
+        event: "jailbreak_attempt_pre_filter",
+        details: {
+          matchedPattern: jailbreakDetection.matchedPattern,
+          message_preview: message.slice(0, 180),
+        },
+      });
+      return res.json({
+        ok: true,
+        reply: SECURITY_NEUTRAL_REPLY,
+        suggested_action_code: "ASK_VALID_CSS_OR_PROGRESS_QUESTION",
+        mode_used: "security_neutral",
+        conversation_id,
+      });
+    }
+
     state.last_activity_at = Date.now();
     const mode_used = resolveIntentMode(intent_mode ?? "auto", message);
     const systemPrompt =
@@ -504,8 +646,9 @@ app.post("/api/emis/chat", async (req, res) => {
         ? buildSystemPromptGuiaJuego()
         : buildSystemPromptTutorCSS();
     const compressedPlayerContext = compressPlayerContext(player_context);
+    const sanitizedCssSnapshot = sanitizeCssSnapshot(css_snapshot || "");
     const compressedCssSnapshot = compressCssSnapshot(
-      css_snapshot,
+      sanitizedCssSnapshot,
       compressedPlayerContext,
       message,
       state,
@@ -631,11 +774,31 @@ ${message}
     });
 
     const { reply, suggested_action_code } = parseModelReply(response?.text || "");
-    const estimatedOutputTokens = estimateTokens(reply);
+    const postFilter = postFilterReply(reply, mode_used);
+    if (postFilter.blocked) {
+      registerSecurityEvent({
+        ip: requestIp,
+        conversationId: conversation_id,
+        event: "model_output_blocked_post_filter",
+        details: {
+          tooLong: postFilter.tooLong,
+          hasOutOfScopeContent: postFilter.hasOutOfScopeContent,
+          hasPromptLeak: postFilter.hasPromptLeak,
+          lacksRoleAlignment: postFilter.lacksRoleAlignment,
+        },
+      });
+    }
+    const finalReply = postFilter.blocked
+      ? SECURITY_NEUTRAL_REPLY
+      : postFilter.sanitizedReply;
+    const finalSuggestedActionCode = postFilter.blocked
+      ? "ASK_VALID_CSS_OR_PROGRESS_QUESTION"
+      : suggested_action_code;
+    const estimatedOutputTokens = estimateTokens(finalReply);
     registerTokenUsage(state, estimatedInputTokens + estimatedOutputTokens);
 
     state.recent_messages.push({ role: "user", text: message });
-    state.recent_messages.push({ role: "assistant", text: reply });
+    state.recent_messages.push({ role: "assistant", text: finalReply });
     state.recent_messages = state.recent_messages.slice(-MAX_RECENT_MESSAGES);
     state.turn_count += 1;
     state.last_activity_at = Date.now();
@@ -662,8 +825,8 @@ ${message}
 
     return res.json({
       ok: true,
-      reply,
-      suggested_action_code,
+      reply: finalReply,
+      suggested_action_code: finalSuggestedActionCode,
       mode_used,
       conversation_id,
     });
