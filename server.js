@@ -22,6 +22,9 @@ const MAX_RECENT_MESSAGES = 8; // 4 turnos completos (user+assistant)
 const SUMMARY_EVERY_TURNS = 5;
 const RECENT_MESSAGES_AFTER_SUMMARY = 4; // mantiene los 2 últimos turnos completos
 const MAX_SUMMARY_CHARS = 1200;
+const TOKEN_BUDGET_10M = 5000;
+const TOKEN_BUDGET_DAY = 30000;
+const NEAR_BUDGET_THRESHOLD = 0.9;
 
 /**
  * conversationMemory guarda estado ligero por conversación para ahorrar tokens.
@@ -34,6 +37,7 @@ const MAX_SUMMARY_CHARS = 1200;
  *     current_level: string,
  *     learning_style: string,
  *   },
+ *   token_usage_events: Array<{ at: number, tokens: number }>,
  *   turn_count: number,
  *   last_activity_at: number,
  * }
@@ -183,11 +187,151 @@ function getOrCreateConversationState(conversationId) {
       current_level: "desconocido",
       learning_style: "desconocido",
     },
+    token_usage_events: [],
     turn_count: 0,
     last_activity_at: Date.now(),
   };
   conversationMemory.set(conversationId, initialState);
   return initialState;
+}
+
+function estimateTokens(text) {
+  if (!text) return 0;
+  return Math.ceil(String(text).length / 4);
+}
+
+function uniqStrings(values = []) {
+  const seen = new Set();
+  const output = [];
+  for (const value of values) {
+    const normalized = String(value).trim();
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(normalized);
+  }
+  return output;
+}
+
+function compressPlayerContext(playerContext) {
+  if (!playerContext) return undefined;
+  return {
+    ...playerContext,
+    unlocked_css: uniqStrings(playerContext.unlocked_css || []),
+  };
+}
+
+function compactCssText(text, maxLen = 1600) {
+  if (!text) return "";
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, maxLen)}\n/* ...css truncado para ahorrar tokens... */`;
+}
+
+function compressCssSnapshot(cssSnapshot, playerContext, message, state) {
+  if (!cssSnapshot) return "";
+
+  const hintText = [
+    playerContext?.level,
+    playerContext?.screen,
+    playerContext?.objective,
+    message,
+    ...state.recent_messages.filter((m) => m.role === "user").slice(-2).map((m) => m.text),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  const hintedSelectors = Array.from(
+    new Set(
+      (hintText.match(/[.#][a-z0-9_-]+/gi) || []).map((s) => s.toLowerCase()),
+    ),
+  );
+
+  const blockMatches = Array.from(cssSnapshot.matchAll(/([^{}]+)\{[^{}]*\}/g));
+  if (!blockMatches.length) {
+    return compactCssText(cssSnapshot, 1600);
+  }
+
+  const usefulBlocks = blockMatches
+    .map((match) => match[0].trim())
+    .filter((block) => {
+      const selector = block.split("{")[0].toLowerCase();
+      if (hintedSelectors.some((token) => selector.includes(token))) return true;
+      if (playerContext?.level && selector.includes(playerContext.level.toLowerCase())) {
+        return true;
+      }
+      if (playerContext?.screen && selector.includes(playerContext.screen.toLowerCase())) {
+        return true;
+      }
+      return false;
+    });
+
+  if (!usefulBlocks.length) {
+    return compactCssText(
+      blockMatches
+        .slice(-6)
+        .map((m) => m[0].trim())
+        .join("\n\n"),
+      1800,
+    );
+  }
+
+  return compactCssText(usefulBlocks.join("\n\n"), 1800);
+}
+
+function getBudgetStatus(state, now = Date.now()) {
+  const tenMinWindowMs = 10 * 60 * 1000;
+  const dayWindowMs = 24 * 60 * 60 * 1000;
+  const tenMinStart = now - tenMinWindowMs;
+  const dayStart = now - dayWindowMs;
+
+  state.token_usage_events = state.token_usage_events.filter(
+    (event) => event.at >= dayStart,
+  );
+
+  const used10m = state.token_usage_events
+    .filter((event) => event.at >= tenMinStart)
+    .reduce((sum, event) => sum + event.tokens, 0);
+  const usedDay = state.token_usage_events.reduce(
+    (sum, event) => sum + event.tokens,
+    0,
+  );
+
+  return {
+    used10m,
+    usedDay,
+    remaining10m: Math.max(0, TOKEN_BUDGET_10M - used10m),
+    remainingDay: Math.max(0, TOKEN_BUDGET_DAY - usedDay),
+    isNearLimit:
+      used10m >= TOKEN_BUDGET_10M * NEAR_BUDGET_THRESHOLD ||
+      usedDay >= TOKEN_BUDGET_DAY * NEAR_BUDGET_THRESHOLD,
+    isAtLimit: used10m >= TOKEN_BUDGET_10M || usedDay >= TOKEN_BUDGET_DAY,
+  };
+}
+
+function registerTokenUsage(state, tokens, at = Date.now()) {
+  if (!tokens || tokens <= 0) return;
+  state.token_usage_events.push({ at, tokens });
+}
+
+function selectOutputTokenBudget(message) {
+  const normalized = message.toLowerCase();
+  const asksExplanationOrCode = [
+    "explica",
+    "por qué",
+    "porque",
+    "snippet",
+    "ejemplo",
+    "código",
+    "codigo",
+    "muestra",
+  ].some((term) => normalized.includes(term));
+
+  if (asksExplanationOrCode) {
+    return { maxOutputTokens: 240, response_mode: "explain_snippet" };
+  }
+  return { maxOutputTokens: 140, response_mode: "simple_doubt" };
 }
 
 async function buildPlayerProfile(aiClient, state, playerContext) {
@@ -279,6 +423,7 @@ ${messagesToSummarize || "(sin mensajes)"}
 
 app.post("/api/emis/chat", async (req, res) => {
   try {
+    const requestStartedAt = Date.now();
     pruneExpiredConversations();
 
     const parsed = ChatSchema.safeParse(req.body);
@@ -302,13 +447,54 @@ app.post("/api/emis/chat", async (req, res) => {
       mode_used === "guia_juego"
         ? buildSystemPromptGuiaJuego()
         : buildSystemPromptTutorCSS();
+    const compressedPlayerContext = compressPlayerContext(player_context);
+    const compressedCssSnapshot = compressCssSnapshot(
+      css_snapshot,
+      compressedPlayerContext,
+      message,
+      state,
+    );
+
+    const budgetBefore = getBudgetStatus(state);
+    if (budgetBefore.isAtLimit) {
+      const ultraBriefReply =
+        "Estoy en modo ahorro extremo. Haz una pregunta más específica (selector + propiedad + resultado esperado).";
+      const inputSize = message.length + (compressedCssSnapshot?.length || 0);
+      const estimatedInputTokens = estimateTokens(message);
+      const estimatedOutputTokens = estimateTokens(ultraBriefReply);
+      registerTokenUsage(state, estimatedInputTokens + estimatedOutputTokens);
+      const latencyMs = Date.now() - requestStartedAt;
+      console.info(
+        JSON.stringify({
+          event: "emis_chat_metrics",
+          conversation_id,
+          input_size: inputSize,
+          estimated_tokens: estimatedInputTokens + estimatedOutputTokens,
+          latency_ms: latencyMs,
+          mode_used: "ultra_brief_budget",
+        }),
+      );
+
+      return res.json({
+        ok: true,
+        reply: ultraBriefReply,
+        mode_used: "ultra_brief_budget",
+        conversation_id,
+      });
+    }
 
     let updatedPlayerProfile = state.player_profile;
-    try {
-      updatedPlayerProfile = await buildPlayerProfile(ai, state, player_context);
-      state.player_profile = updatedPlayerProfile;
-    } catch (profileError) {
-      console.warn("No se pudo refrescar player_profile:", profileError.message);
+    if (!budgetBefore.isNearLimit) {
+      try {
+        updatedPlayerProfile = await buildPlayerProfile(
+          ai,
+          state,
+          compressedPlayerContext,
+        );
+        state.player_profile = updatedPlayerProfile;
+      } catch (profileError) {
+        console.warn("No se pudo refrescar player_profile:", profileError.message);
+      }
     }
 
     const recentTurnsText =
@@ -324,17 +510,29 @@ ${state.running_summary || "(sin resumen todavía)"}
 ${recentTurnsText}
 
 [CONTEXTO JUGADOR]
-${JSON.stringify(player_context || {}, null, 2)}
+${JSON.stringify(compressedPlayerContext || {}, null, 2)}
 
 [PERFIL DEL JUGADOR]
 ${JSON.stringify(updatedPlayerProfile, null, 2)}
 
 [CSS ACTUAL]
-${css_snapshot || "(sin css)"}
+${compressedCssSnapshot || "(sin css)"}
 
 [PREGUNTA]
 ${message}
 `.trim();
+
+    const estimatedInputTokens = estimateTokens(`${systemPrompt}\n\n${prompt}`);
+    const { maxOutputTokens: selectedMaxOutputTokens, response_mode } =
+      selectOutputTokenBudget(message);
+    const dynamicMaxOutputTokens = Math.max(
+      120,
+      Math.min(
+        selectedMaxOutputTokens,
+        budgetBefore.remaining10m,
+        budgetBefore.remainingDay,
+      ),
+    );
 
     const response = await ai.models.generateContent({
       model: MODEL,
@@ -347,7 +545,7 @@ ${message}
       config: {
         temperature: 0.6,
         topP: 0.9,
-        maxOutputTokens: 300,
+        maxOutputTokens: dynamicMaxOutputTokens,
         // si usas 2.5 y quieres ahorrar:
         thinkingConfig: { thinkingBudget: 0 },
       },
@@ -356,6 +554,8 @@ ${message}
     const reply =
       response?.text?.trim() ||
       "No pude responder ahora mismo. Intenta otra vez.";
+    const estimatedOutputTokens = estimateTokens(reply);
+    registerTokenUsage(state, estimatedInputTokens + estimatedOutputTokens);
 
     state.recent_messages.push({ role: "user", text: message });
     state.recent_messages.push({ role: "assistant", text: reply });
@@ -370,6 +570,18 @@ ${message}
         console.warn("No se pudo refrescar running_summary:", summaryError.message);
       }
     }
+
+    const latencyMs = Date.now() - requestStartedAt;
+    console.info(
+      JSON.stringify({
+        event: "emis_chat_metrics",
+        conversation_id,
+        input_size: prompt.length,
+        estimated_tokens: estimatedInputTokens + estimatedOutputTokens,
+        latency_ms: latencyMs,
+        mode_used: response_mode,
+      }),
+    );
 
     return res.json({ ok: true, reply, mode_used, conversation_id });
   } catch (err) {
