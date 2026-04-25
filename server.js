@@ -4,6 +4,7 @@ import helmet from "helmet";
 import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
 import { z } from "zod";
+import crypto from "node:crypto";
 import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
@@ -16,6 +17,28 @@ const ai = new GoogleGenAI({
 });
 
 const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite"; // cambia si usas 3.1 preview
+const CONVERSATION_TTL_MS = 30 * 60 * 1000;
+const MAX_RECENT_MESSAGES = 8; // 4 turnos completos (user+assistant)
+const SUMMARY_EVERY_TURNS = 5;
+const RECENT_MESSAGES_AFTER_SUMMARY = 4; // mantiene los 2 últimos turnos completos
+const MAX_SUMMARY_CHARS = 1200;
+
+/**
+ * conversationMemory guarda estado ligero por conversación para ahorrar tokens.
+ * key: conversation_id
+ * value: {
+ *   recent_messages: Array<{ role: "user" | "assistant", text: string }>,
+ *   running_summary: string,
+ *   player_profile: {
+ *     frequent_css_errors: string[],
+ *     current_level: string,
+ *     learning_style: string,
+ *   },
+ *   turn_count: number,
+ *   last_activity_at: number,
+ * }
+ */
+const conversationMemory = new Map();
 
 app.use(helmet());
 app.use(express.json({ limit: "1mb" }));
@@ -139,8 +162,125 @@ function resolveIntentMode(intentMode, message) {
   return "tutor_css";
 }
 
+function pruneExpiredConversations() {
+  const now = Date.now();
+  for (const [conversationId, entry] of conversationMemory.entries()) {
+    if (now - entry.last_activity_at > CONVERSATION_TTL_MS) {
+      conversationMemory.delete(conversationId);
+    }
+  }
+}
+
+function getOrCreateConversationState(conversationId) {
+  const existing = conversationMemory.get(conversationId);
+  if (existing) return existing;
+
+  const initialState = {
+    recent_messages: [],
+    running_summary: "",
+    player_profile: {
+      frequent_css_errors: [],
+      current_level: "desconocido",
+      learning_style: "desconocido",
+    },
+    turn_count: 0,
+    last_activity_at: Date.now(),
+  };
+  conversationMemory.set(conversationId, initialState);
+  return initialState;
+}
+
+async function buildPlayerProfile(aiClient, state, playerContext) {
+  const profilePrompt = `
+Actualiza SOLO este perfil JSON del alumno basado en el contexto nuevo:
+${JSON.stringify(state.player_profile)}
+
+Contexto del jugador:
+${JSON.stringify(playerContext || {}, null, 2)}
+
+Devuelve ÚNICAMENTE JSON válido con forma exacta:
+{
+  "frequent_css_errors": ["..."],
+  "current_level": "...",
+  "learning_style": "..."
+}
+Reglas:
+- frequent_css_errors: máximo 4 strings cortos.
+- current_level y learning_style: una frase breve.
+`.trim();
+
+  const profileResponse = await aiClient.models.generateContent({
+    model: MODEL,
+    contents: [{ role: "user", parts: [{ text: profilePrompt }] }],
+    config: {
+      temperature: 0.2,
+      topP: 0.9,
+      maxOutputTokens: 180,
+      thinkingConfig: { thinkingBudget: 0 },
+    },
+  });
+
+  const raw = profileResponse?.text?.trim() || "";
+  const normalizedRaw = raw.replace(/```json|```/g, "").trim();
+  const parsed = JSON.parse(normalizedRaw);
+  if (
+    !parsed ||
+    !Array.isArray(parsed.frequent_css_errors) ||
+    typeof parsed.current_level !== "string" ||
+    typeof parsed.learning_style !== "string"
+  ) {
+    throw new Error("Formato de perfil inválido");
+  }
+
+  return {
+    frequent_css_errors: parsed.frequent_css_errors.slice(0, 4).map(String),
+    current_level: parsed.current_level.slice(0, 120),
+    learning_style: parsed.learning_style.slice(0, 120),
+  };
+}
+
+async function refreshRunningSummary(aiClient, state) {
+  const messagesToSummarize = state.recent_messages
+    .map((m) => `${m.role.toUpperCase()}: ${m.text}`)
+    .join("\n");
+
+  const summaryPrompt = `
+Resume la conversación para memoria de tutor (60-90 palabras).
+Incluye: progreso del alumno, dudas pendientes, y próximo paso recomendado.
+No repitas literalmente frases largas.
+
+Resumen previo:
+${state.running_summary || "(vacío)"}
+
+Mensajes recientes:
+${messagesToSummarize || "(sin mensajes)"}
+`.trim();
+
+  const summaryResponse = await aiClient.models.generateContent({
+    model: MODEL,
+    contents: [{ role: "user", parts: [{ text: summaryPrompt }] }],
+    config: {
+      temperature: 0.3,
+      topP: 0.9,
+      maxOutputTokens: 180,
+      thinkingConfig: { thinkingBudget: 0 },
+    },
+  });
+
+  const summaryText = (summaryResponse?.text?.trim() || "").slice(
+    0,
+    MAX_SUMMARY_CHARS,
+  );
+  state.running_summary = summaryText || state.running_summary;
+  state.recent_messages = state.recent_messages.slice(
+    -RECENT_MESSAGES_AFTER_SUMMARY,
+  );
+}
+
 app.post("/api/emis/chat", async (req, res) => {
   try {
+    pruneExpiredConversations();
+
     const parsed = ChatSchema.safeParse(req.body);
     if (!parsed.success) {
       return res
@@ -153,15 +293,41 @@ app.post("/api/emis/chat", async (req, res) => {
     }
 
     const { message, player_context, css_snapshot, intent_mode } = parsed.data;
+    const conversation_id =
+      parsed.data.conversation_id?.trim() || crypto.randomUUID();
+    const state = getOrCreateConversationState(conversation_id);
+    state.last_activity_at = Date.now();
     const mode_used = resolveIntentMode(intent_mode ?? "auto", message);
     const systemPrompt =
       mode_used === "guia_juego"
         ? buildSystemPromptGuiaJuego()
         : buildSystemPromptTutorCSS();
 
+    let updatedPlayerProfile = state.player_profile;
+    try {
+      updatedPlayerProfile = await buildPlayerProfile(ai, state, player_context);
+      state.player_profile = updatedPlayerProfile;
+    } catch (profileError) {
+      console.warn("No se pudo refrescar player_profile:", profileError.message);
+    }
+
+    const recentTurnsText =
+      state.recent_messages
+        .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
+        .join("\n") || "(sin historial reciente)";
+
     const prompt = `
+[RESUMEN ACUMULADO]
+${state.running_summary || "(sin resumen todavía)"}
+
+[ÚLTIMOS TURNOS]
+${recentTurnsText}
+
 [CONTEXTO JUGADOR]
 ${JSON.stringify(player_context || {}, null, 2)}
+
+[PERFIL DEL JUGADOR]
+${JSON.stringify(updatedPlayerProfile, null, 2)}
 
 [CSS ACTUAL]
 ${css_snapshot || "(sin css)"}
@@ -190,7 +356,22 @@ ${message}
     const reply =
       response?.text?.trim() ||
       "No pude responder ahora mismo. Intenta otra vez.";
-    return res.json({ ok: true, reply, mode_used });
+
+    state.recent_messages.push({ role: "user", text: message });
+    state.recent_messages.push({ role: "assistant", text: reply });
+    state.recent_messages = state.recent_messages.slice(-MAX_RECENT_MESSAGES);
+    state.turn_count += 1;
+    state.last_activity_at = Date.now();
+
+    if (state.turn_count % SUMMARY_EVERY_TURNS === 0) {
+      try {
+        await refreshRunningSummary(ai, state);
+      } catch (summaryError) {
+        console.warn("No se pudo refrescar running_summary:", summaryError.message);
+      }
+    }
+
+    return res.json({ ok: true, reply, mode_used, conversation_id });
   } catch (err) {
     console.error(err);
     return res
