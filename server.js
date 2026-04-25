@@ -116,9 +116,23 @@ const ChatSchema = z.object({
       failed_attempts_css: z.array(z.string().max(120)).max(30).optional(),
     })
     .optional(),
+  css_snapshot_fragment: z.string().max(10000).optional(),
   css_snapshot: z.string().max(10000).optional(),
   conversation_id: z.string().max(120).optional(),
 });
+
+const LOCAL_LEVEL_TIPS = {
+  nivel_1:
+    "Tip nivel_1: empieza con selectores simples (.clase, #id) y ajusta color + font-size antes de tocar layout.",
+  nivel_2:
+    "Tip nivel_2: activa display:flex en el contenedor y prueba justify-content + align-items para alinear elementos rápido.",
+  nivel_3:
+    "Tip nivel_3: usa grid-template-columns con unidades fr para dividir espacio sin números mágicos.",
+  nivel_4:
+    "Tip nivel_4: combina position:relative en el padre con position:absolute en hijos solo cuando necesites overlays precisos.",
+  default:
+    "Tip general: prueba cambios pequeños (1 propiedad por intento) y valida visualmente qué propiedad causó el efecto.",
+};
 
 function buildSystemPromptTutorCSS() {
   return `
@@ -511,6 +525,33 @@ function selectOutputTokenBudget(message) {
   return { maxOutputTokens: 140, response_mode: "simple_doubt" };
 }
 
+function resolveLevelFromContext(playerContext = {}) {
+  if (!playerContext || typeof playerContext !== "object") return "default";
+  const normalizedLevel = String(playerContext.level || "")
+    .trim()
+    .toLowerCase();
+  return normalizedLevel || "default";
+}
+
+function buildLocalFallback({ modeUsed = "tutor_css", playerContext = {} }) {
+  const level = resolveLevelFromContext(playerContext);
+  const tip = LOCAL_LEVEL_TIPS[level] || LOCAL_LEVEL_TIPS.default;
+  const modeLead =
+    modeUsed === "guia_juego"
+      ? "No pude contactar al motor remoto, así que voy con guía local."
+      : "No pude contactar al motor remoto, así que voy con tutor local.";
+
+  return {
+    reply: `${modeLead} ${tip}`,
+    suggested_action_code:
+      modeUsed === "guia_juego" ? "OPEN_CURRENT_QUEST_LOG" : "APPLY_LEVEL_TIP",
+    follow_up_question:
+      modeUsed === "guia_juego"
+        ? "¿Cuál es tu quest_step actual para darte un paso exacto?"
+        : "¿Qué propiedad CSS estás intentando ajustar ahora?",
+  };
+}
+
 async function buildPlayerProfile(aiClient, state, playerContext) {
   const profilePrompt = `
 Actualiza SOLO este perfil JSON del alumno basado en el contexto nuevo:
@@ -614,7 +655,8 @@ app.post("/api/emis/chat", async (req, res) => {
         });
     }
 
-    const { message, player_context, css_snapshot, intent_mode } = parsed.data;
+    const { message, player_context, css_snapshot, css_snapshot_fragment, intent_mode } =
+      parsed.data;
     const requestIp = String(req.ip || req.headers["x-forwarded-for"] || "unknown");
     const conversation_id =
       parsed.data.conversation_id?.trim() || crypto.randomUUID();
@@ -636,6 +678,7 @@ app.post("/api/emis/chat", async (req, res) => {
         suggested_action_code: "ASK_VALID_CSS_OR_PROGRESS_QUESTION",
         mode_used: "security_neutral",
         conversation_id,
+        follow_up_question: null,
       });
     }
 
@@ -646,7 +689,8 @@ app.post("/api/emis/chat", async (req, res) => {
         ? buildSystemPromptGuiaJuego()
         : buildSystemPromptTutorCSS();
     const compressedPlayerContext = compressPlayerContext(player_context);
-    const sanitizedCssSnapshot = sanitizeCssSnapshot(css_snapshot || "");
+    const cssSnapshotInput = css_snapshot_fragment || css_snapshot || "";
+    const sanitizedCssSnapshot = sanitizeCssSnapshot(cssSnapshotInput);
     const compressedCssSnapshot = compressCssSnapshot(
       sanitizedCssSnapshot,
       compressedPlayerContext,
@@ -680,6 +724,7 @@ app.post("/api/emis/chat", async (req, res) => {
         suggested_action_code: "REFINE_QUESTION",
         mode_used: "ultra_brief_budget",
         conversation_id,
+        follow_up_question: null,
       });
     }
 
@@ -721,6 +766,7 @@ app.post("/api/emis/chat", async (req, res) => {
         suggested_action_code: "PROVIDE_QUEST_CONTEXT",
         mode_used,
         conversation_id,
+        follow_up_question: "¿Cuál es tu quest_step exacto ahora mismo?",
       });
     }
 
@@ -756,24 +802,35 @@ ${message}
       ),
     );
 
-    const response = await ai.models.generateContent({
-      model: MODEL,
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: `${systemPrompt}\n\n${prompt}` }],
+    let parsedModelReply;
+    try {
+      const response = await ai.models.generateContent({
+        model: MODEL,
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: `${systemPrompt}\n\n${prompt}` }],
+          },
+        ],
+        config: {
+          temperature: 0.6,
+          topP: 0.9,
+          maxOutputTokens: dynamicMaxOutputTokens,
+          // si usas 2.5 y quieres ahorrar:
+          thinkingConfig: { thinkingBudget: 0 },
         },
-      ],
-      config: {
-        temperature: 0.6,
-        topP: 0.9,
-        maxOutputTokens: dynamicMaxOutputTokens,
-        // si usas 2.5 y quieres ahorrar:
-        thinkingConfig: { thinkingBudget: 0 },
-      },
-    });
+      });
+      parsedModelReply = parseModelReply(response?.text || "");
+    } catch (modelError) {
+      console.warn("Fallo de modelo remoto, aplicando fallback local:", modelError.message);
+      parsedModelReply = buildLocalFallback({
+        modeUsed: mode_used,
+        playerContext: compressedPlayerContext,
+      });
+    }
 
-    const { reply, suggested_action_code } = parseModelReply(response?.text || "");
+    const { reply, suggested_action_code, follow_up_question = null } =
+      parsedModelReply;
     const postFilter = postFilterReply(reply, mode_used);
     if (postFilter.blocked) {
       registerSecurityEvent({
@@ -829,12 +886,32 @@ ${message}
       suggested_action_code: finalSuggestedActionCode,
       mode_used,
       conversation_id,
+      follow_up_question,
     });
   } catch (err) {
     console.error(err);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Error interno del servidor" });
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const safeConversationId =
+      typeof body.conversation_id === "string" && body.conversation_id.trim()
+        ? body.conversation_id.trim().slice(0, 120)
+        : crypto.randomUUID();
+    const safeIntentMode =
+      body.intent_mode === "guia_juego" || body.intent_mode === "tutor_css"
+        ? body.intent_mode
+        : "tutor_css";
+    const fallback = buildLocalFallback({
+      modeUsed: safeIntentMode,
+      playerContext: body.player_context || {},
+    });
+
+    return res.status(200).json({
+      ok: true,
+      reply: fallback.reply,
+      conversation_id: safeConversationId,
+      mode_used: "local_fallback",
+      suggested_action_code: fallback.suggested_action_code,
+      follow_up_question: fallback.follow_up_question,
+    });
   }
 });
 
