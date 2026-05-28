@@ -32,6 +32,7 @@ import {
   resolveIntentMode,
   sanitizeCssSnapshot,
   selectOutputTokenBudget,
+  isGreetingOnly,
 } from "../utils/chatUtils.js";
 import {
   generateDebugFlags,
@@ -93,6 +94,7 @@ export function createChatHandler(createAiClient) {
         css_snapshot,
         css_snapshot_fragment,
         intent_mode,
+        chat_surface = "bullet_creator",
       } = parsed.data;
       const aiClient = createAiClient(playerApiKey);
       const requestIp = String(req.ip || req.headers["x-forwarded-for"] || "unknown");
@@ -120,7 +122,40 @@ export function createChatHandler(createAiClient) {
       }
 
       state.last_activity_at = Date.now();
-      const mode_used = resolveIntentMode(intent_mode ?? "auto", message);
+      const mode_used = resolveIntentMode(intent_mode ?? "auto", message, chat_surface);
+      if (isGreetingOnly(message)) {
+        const greetingContext = compressPlayerContext(player_context) || {};
+        const place = String(
+          greetingContext.current_area_description ||
+            greetingContext.zone_id ||
+            greetingContext.level ||
+            "la zona actual",
+        );
+        const objectiveText = String(
+          greetingContext.objective ||
+            "si quieres, dime que ves y te marco el siguiente paso",
+        );
+        const greetingReply =
+          chat_surface === "general_chat"
+            ? `Hola, soy Emis. Te tengo ubicado en ${place}. Objetivo actual: ${objectiveText}. Si quieres, preguntame por la ruta, el puzzle o si tu bala actual te conviene.`
+            : "Hola, soy Emis. Dime que propiedad CSS, forma o comportamiento quieres ajustar en tu bala y lo revisamos.";
+        state.recent_messages.push({ role: "user", text: message });
+        state.recent_messages.push({ role: "assistant", text: greetingReply });
+        state.recent_messages = state.recent_messages.slice(-MAX_RECENT_MESSAGES);
+        state.turn_count += 1;
+        state.last_activity_at = Date.now();
+        registerTokenUsage(state, estimateTokens(message) + estimateTokens(greetingReply));
+        return res.json({
+          ok: true,
+          reply: greetingReply,
+          suggested_action_code:
+            chat_surface === "general_chat" ? "ASK_GAME_CONTEXT" : "ASK_CSS_GOAL",
+          mode_used,
+          chat_surface,
+          conversation_id,
+          follow_up_question: null,
+        });
+      }
       const systemPrompt =
         mode_used === "guia_juego"
           ? buildSystemPromptGuiaJuego()
@@ -185,12 +220,12 @@ export function createChatHandler(createAiClient) {
           .join("\n") || "(sin historial reciente)";
 
       const gameContext = compressedPlayerContext || {};
-      if (
+      if (false &&
         mode_used === "guia_juego" &&
         (!gameContext.quest_id || !gameContext.quest_step)
       ) {
         const clarificationReply =
-          "Para guiarte bien, dime tu quest_id y quest_step actuales.";
+          "Te puedo orientar mejor si me dices que ves ahora mismo: zona, puerta, enemigo o puzzle activo.";
         const estimatedOutputTokens = estimateTokens(clarificationReply);
         registerTokenUsage(state, estimateTokens(message) + estimatedOutputTokens);
 
@@ -203,7 +238,7 @@ export function createChatHandler(createAiClient) {
         return res.json({
           ok: true,
           reply: clarificationReply,
-          suggested_action_code: "PROVIDE_QUEST_CONTEXT",
+          suggested_action_code: "ASK_VISIBLE_GAME_CONTEXT",
           mode_used,
           conversation_id,
           follow_up_question: "¿Cuál es tu quest_step exacto ahora mismo?",
@@ -218,7 +253,7 @@ ${state.running_summary || "(sin resumen todavía)"}
 ${recentTurnsText}
 
 [GAME CONTEXT]
-${JSON.stringify(gameContext, null, 2)}
+${JSON.stringify({ ...gameContext, chat_surface }, null, 2)}
 
 [PERFIL DEL JUGADOR]
 ${JSON.stringify(updatedPlayerProfile, null, 2)}

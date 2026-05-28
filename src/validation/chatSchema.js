@@ -3,6 +3,7 @@ import { z } from "zod";
 export const ChatSchema = z.object({
   message: z.string().min(1).max(1200),
   intent_mode: z.enum(["tutor_css", "guia_juego", "auto"]).optional(),
+  chat_surface: z.enum(["bullet_creator", "general_chat"]).optional(),
   player_context: z
     .object({
       screen: z.string().optional(),
@@ -12,10 +13,22 @@ export const ChatSchema = z.object({
       zone_id: z.string().max(120).optional(),
       quest_id: z.string().max(120).optional(),
       quest_step: z.string().max(120).optional(),
+      current_area_description: z.string().max(600).optional(),
+      current_dialog_context: z.string().max(600).optional(),
+      recent_event: z.string().max(600).optional(),
       nearby_npcs: z.array(z.string().max(120)).max(20).optional(),
       available_portals: z.array(z.string().max(120)).max(20).optional(),
       inventory_tags: z.array(z.string().max(120)).max(40).optional(),
       failed_attempts_css: z.array(z.string().max(120)).max(30).optional(),
+      movement_unlocks: z.record(z.string(), z.boolean()).optional(),
+      active_bullet: z
+        .object({
+          css_text: z.string().max(1200).optional(),
+          css_rules: z.array(z.string()).optional(),
+          css_properties: z.record(z.string(), z.any()).optional(),
+          updated_at: z.string().max(120).optional(),
+        })
+        .optional(),
     })
     .optional(),
   css_snapshot_fragment: z.string().max(10000).optional(),

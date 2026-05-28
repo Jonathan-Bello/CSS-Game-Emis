@@ -48,7 +48,7 @@ export function parseModelReply(rawText = "") {
 
   try {
     const parsed = JSON.parse(cleaned);
-    const reply = String(parsed?.reply || "").trim();
+    const reply = normalizeReplyText(parsed?.reply || parsed?.message || parsed);
     const suggested_action_code = String(parsed?.suggested_action_code || "")
       .trim()
       .toUpperCase()
@@ -66,6 +66,48 @@ export function parseModelReply(rawText = "") {
       suggested_action_code: "FOLLOW_GUIDANCE",
     };
   }
+}
+
+export function normalizeReplyText(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") {
+    return String(value.reply || value.message || value.Rippledai || value.rippledai || "")
+      .trim()
+      .slice(0, 1000);
+  }
+
+  const text = String(value).trim();
+  if (!text) return "";
+  if (!text.startsWith("{")) return text.slice(0, 1000);
+
+  try {
+    return normalizeReplyText(JSON.parse(text));
+  } catch {
+    return text.slice(0, 1000);
+  }
+}
+
+export function isGreetingOnly(message = "") {
+  const normalized = String(message)
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[!¡?¿.,;:()\[\]"']/g, "")
+    .replace(/\s+/g, " ");
+
+  return [
+    "hola",
+    "holi",
+    "buenas",
+    "buen dia",
+    "buenos dias",
+    "buenas tardes",
+    "buenas noches",
+    "hey",
+    "hello",
+    "hi",
+  ].includes(normalized);
 }
 
 export function compactCssText(text, maxLen = 1600) {
@@ -159,9 +201,13 @@ export function compressCssSnapshot(cssSnapshot, playerContext, message, state) 
   return compactCssText(usefulBlocks.join("\n\n"), 1800);
 }
 
-export function resolveIntentMode(intentMode, message) {
+export function resolveIntentMode(intentMode, message, chatSurface = "bullet_creator") {
   if (intentMode === "tutor_css" || intentMode === "guia_juego") {
     return intentMode;
+  }
+
+  if (chatSurface === "general_chat" && isGreetingOnly(message)) {
+    return "guia_juego";
   }
 
   const normalizedMessage = message.toLowerCase();
@@ -175,7 +221,7 @@ export function resolveIntentMode(intentMode, message) {
   );
   if (hasGameTerms) return "guia_juego";
 
-  return "tutor_css";
+  return chatSurface === "general_chat" ? "guia_juego" : "tutor_css";
 }
 
 export function selectOutputTokenBudget(message) {
