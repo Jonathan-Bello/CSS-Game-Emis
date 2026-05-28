@@ -28,11 +28,12 @@ Crea un archivo `.env` en la raíz:
 
 ```env
 PORT=8080
-GEMINI_API_KEY=tu_api_key
 GEMINI_MODEL=gemini-2.5-flash-lite
+FRONTEND_ORIGINS=https://tu-sitio.netlify.app,http://localhost:4321,http://127.0.0.1:4321
 ```
 
 > `GEMINI_MODEL` es opcional; por defecto usa `gemini-2.5-flash-lite`.
+> `GEMINI_API_KEY` ya no es requerida para la demo web: el juego envia la key del jugador en el header `X-Emis-Api-Key`.
 
 ### Instalar y correr
 
@@ -156,6 +157,7 @@ curl -s http://localhost:8080/health | jq
 ```bash
 curl -s -X POST http://localhost:8080/api/emis/chat \
   -H "Content-Type: application/json" \
+  -H "X-Emis-Api-Key: tu_api_key_gemini" \
   -d '{
     "conversation_id": "conv_demo_001",
     "message": "No logro centrar el boton de jugar",

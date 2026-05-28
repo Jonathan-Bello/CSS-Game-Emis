@@ -33,12 +33,46 @@ import {
   sanitizeCssSnapshot,
   selectOutputTokenBudget,
 } from "../utils/chatUtils.js";
+import {
+  generateDebugFlags,
+  printDebugFlags,
+} from "../utils/debugFlags.js";
 
-export function createChatHandler(aiClient) {
+function readPlayerApiKey(req) {
+  const rawHeader = req.get("X-Emis-Api-Key") || "";
+  return rawHeader.trim();
+}
+
+function isAuthModelError(error) {
+  const status = Number(error?.status || error?.code || error?.response?.status || 0);
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    status === 400 ||
+    status === 401 ||
+    status === 403 ||
+    message.includes("api key") ||
+    message.includes("apikey") ||
+    message.includes("permission") ||
+    message.includes("unauthorized") ||
+    message.includes("forbidden")
+  );
+}
+
+export function createChatHandler(createAiClient) {
   return async function chatHandler(req, res) {
     try {
       const requestStartedAt = Date.now();
+      const requestId = crypto.randomUUID().slice(0, 8);
       pruneExpiredConversations();
+
+      const playerApiKey = readPlayerApiKey(req);
+      if (!playerApiKey) {
+        return res.status(401).json({
+          ok: false,
+          error: "API key de Gemini requerida para usar Emis.",
+          code: "missing_api_key",
+        });
+      }
 
       const parsed = ChatSchema.safeParse(req.body);
       if (!parsed.success) {
@@ -49,6 +83,10 @@ export function createChatHandler(aiClient) {
         });
       }
 
+      // 🚩 BANDERAS DE DEBUG - Verificar contexto recibido
+      const debugFlags = generateDebugFlags(req.body);
+      printDebugFlags(debugFlags, requestId);
+
       const {
         message,
         player_context,
@@ -56,6 +94,7 @@ export function createChatHandler(aiClient) {
         css_snapshot_fragment,
         intent_mode,
       } = parsed.data;
+      const aiClient = createAiClient(playerApiKey);
       const requestIp = String(req.ip || req.headers["x-forwarded-for"] || "unknown");
       const conversation_id = parsed.data.conversation_id?.trim() || crypto.randomUUID();
       const state = getOrCreateConversationState(conversation_id);
@@ -222,6 +261,13 @@ ${message}
         });
         parsedModelReply = parseModelReply(response?.text || "");
       } catch (modelError) {
+        if (isAuthModelError(modelError)) {
+          return res.status(401).json({
+            ok: false,
+            error: "La API key de Gemini no fue aceptada.",
+            code: "invalid_api_key",
+          });
+        }
         console.warn("Fallo de modelo remoto, aplicando fallback local:", modelError.message);
         parsedModelReply = buildLocalFallback({
           modeUsed: mode_used,
