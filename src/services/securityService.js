@@ -58,7 +58,7 @@ export function registerSecurityEvent({ ip, conversationId, event, details = {} 
 
   console.warn(
     JSON.stringify({
-      event: "emis_security_event",
+      event: "hemis_security_event",
       security_event_type: event,
       ip,
       conversation_id: conversationId,

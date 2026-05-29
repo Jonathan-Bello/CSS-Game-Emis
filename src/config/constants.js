@@ -1,4 +1,8 @@
-export const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+export const MODEL =
+  process.env.HEMIS_GEMINI_MODEL ||
+  process.env.EMIS_GEMINI_MODEL ||
+  process.env.GEMINI_MODEL ||
+  "gemini-2.5-flash-lite";
 export const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 export const MAX_RECENT_MESSAGES = 8;
 export const SUMMARY_EVERY_TURNS = 5;

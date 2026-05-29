@@ -40,7 +40,7 @@ import {
 } from "../utils/debugFlags.js";
 
 function readPlayerApiKey(req) {
-  const rawHeader = req.get("X-Emis-Api-Key") || "";
+  const rawHeader = req.get("X-Hemis-Api-Key") || req.get("X-Emis-Api-Key") || "";
   return rawHeader.trim();
 }
 
@@ -70,7 +70,7 @@ export function createChatHandler(createAiClient) {
       if (!playerApiKey) {
         return res.status(401).json({
           ok: false,
-          error: "API key de Gemini requerida para usar Emis.",
+          error: "API key de Gemini requerida para usar Hemis.",
           code: "missing_api_key",
         });
       }
@@ -137,8 +137,8 @@ export function createChatHandler(createAiClient) {
         );
         const greetingReply =
           chat_surface === "general_chat"
-            ? `Hola, soy Emis. Te tengo ubicado en ${place}. Objetivo actual: ${objectiveText}. Si quieres, preguntame por la ruta, el puzzle o si tu bala actual te conviene.`
-            : "Hola, soy Emis. Dime que propiedad CSS, forma o comportamiento quieres ajustar en tu bala y lo revisamos.";
+            ? `Hola, soy Hemis. Te tengo ubicado en ${place}. Objetivo actual: ${objectiveText}. Si quieres, preguntame por la ruta, el puzzle o si tu bala actual te conviene.`
+            : "Hola, soy Hemis. Dime que propiedad CSS, forma o comportamiento quieres ajustar en tu bala y lo revisamos.";
         state.recent_messages.push({ role: "user", text: message });
         state.recent_messages.push({ role: "assistant", text: greetingReply });
         state.recent_messages = state.recent_messages.slice(-MAX_RECENT_MESSAGES);
@@ -181,7 +181,7 @@ export function createChatHandler(createAiClient) {
         const latencyMs = Date.now() - requestStartedAt;
         console.info(
           JSON.stringify({
-            event: "emis_chat_metrics",
+            event: "hemis_chat_metrics",
             conversation_id,
             input_size: inputSize,
             estimated_tokens: estimatedInputTokens + estimatedOutputTokens,
@@ -351,7 +351,7 @@ ${message}
       const latencyMs = Date.now() - requestStartedAt;
       console.info(
         JSON.stringify({
-          event: "emis_chat_metrics",
+          event: "hemis_chat_metrics",
           conversation_id,
           input_size: prompt.length,
           estimated_tokens: estimatedInputTokens + estimatedOutputTokens,

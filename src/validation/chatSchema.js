@@ -16,6 +16,7 @@ export const ChatSchema = z.object({
       current_area_description: z.string().max(600).optional(),
       current_dialog_context: z.string().max(600).optional(),
       recent_event: z.string().max(600).optional(),
+      level_context_document: z.string().max(8000).optional(),
       nearby_npcs: z.array(z.string().max(120)).max(20).optional(),
       available_portals: z.array(z.string().max(120)).max(20).optional(),
       inventory_tags: z.array(z.string().max(120)).max(40).optional(),

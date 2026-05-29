@@ -5,5 +5,5 @@ import { createApp } from "./src/app.js";
 const app = createApp(createAiClient);
 
 app.listen(PORT, () => {
-  console.log(`Emis backend corriendo en http://localhost:${PORT}`);
+  console.log(`Hemis backend corriendo en http://localhost:${PORT}`);
 });

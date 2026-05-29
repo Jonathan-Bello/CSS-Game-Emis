@@ -32,7 +32,7 @@ function requestConsoleLogger(req, res, next) {
   res.json = function jsonWithConsoleLog(body) {
     console.info(
       JSON.stringify({
-        event: "emis_request_completed",
+        event: "hemis_request_completed",
         method: req.method,
         path: req.originalUrl,
         status_code: res.statusCode,
@@ -74,7 +74,12 @@ export function createApp(createAiClient) {
     cors({
       origin: resolveCorsOrigin,
       methods: ["POST", "GET"],
-      allowedHeaders: ["Content-Type", "Authorization", "X-Emis-Api-Key"],
+      allowedHeaders: [
+        "Content-Type",
+        "Authorization",
+        "X-Hemis-Api-Key",
+        "X-Emis-Api-Key",
+      ],
     }),
   );
   app.use(requestConsoleLogger);
@@ -89,10 +94,12 @@ export function createApp(createAiClient) {
   );
 
   app.get("/health", (_, res) => {
-    res.json({ ok: true, service: "emis-backend" });
+    res.json({ ok: true, service: "hemis-backend" });
   });
 
-  app.post("/api/emis/chat", createChatHandler(createAiClient));
+  const chatHandler = createChatHandler(createAiClient);
+  app.post("/api/hemis/chat", chatHandler);
+  app.post("/api/emis/chat", chatHandler);
 
   return app;
 }

@@ -1,190 +1,99 @@
-# CSS-Game-Emis API
+# Hemis Backend
 
-Backend de **Emis**, asistente para un videojuego educativo de CSS, con dos modos de respuesta:
-- `tutor_css`: ayuda técnica sobre CSS.
-- `guia_juego`: guía de progreso dentro del juego.
+Backend Express para **Hemis**, asistente contextual de _Citadel of Solar Souls (CSS)_. Hemis opera como tutor de CSS y guia diegetica del juego: responde dudas, evalua intenciones de codigo, considera el contexto de nivel y devuelve orientacion breve para el jugador.
 
-## 1) ¿Qué hace esta API?
+> El repositorio publico conserva la URL historica `CSS-Game-Emis` por continuidad: https://github.com/Jonathan-Bello/CSS-Game-Emis. El nombre del producto y la documentacion canonica es **Hemis**.
 
-La API expone dos endpoints:
+## URLs oficiales
 
-- `GET /health`: estado básico del servicio.
-- `POST /api/emis/chat`: endpoint principal de conversación.
+- Sitio: https://css.jonathanbello.com/
+- GDD: https://css.jonathanbello.com/gdd/
+- Demo web: https://css.jonathanbello.com/demo/
+- Backend desplegado: https://css-game-emis.onrender.com/
 
-El endpoint de chat:
-- valida el payload con Zod,
-- detecta intentos de jailbreak básicos,
-- decide modo (`tutor_css`/`guia_juego`) automáticamente si viene `intent_mode=auto`,
-- comprime contexto e historial para ahorrar tokens,
-- llama a Gemini,
-- aplica filtros de seguridad al output,
-- y si falla el modelo remoto, responde con fallback local (sin tumbar la integración).
+## Endpoints
 
-## 2) Requisitos y ejecución local
+- `GET /health`: estado del servicio.
+- `POST /api/hemis/chat`: endpoint canonico.
+- `POST /api/emis/chat`: alias legacy.
 
-### Variables de entorno
+## Headers
 
-Crea un archivo `.env` en la raíz:
+- Canonico: `X-Hemis-Api-Key`
+- Legacy: `X-Emis-Api-Key`
+
+La API key de Gemini se recibe por request desde el jugador. Para despliegues institucionales tambien se puede usar una key de entorno como fallback.
+
+## Variables de entorno
 
 ```env
-PORT=8080
-GEMINI_MODEL=gemini-2.5-flash-lite
-FRONTEND_ORIGINS=https://tu-sitio.netlify.app,http://localhost:4321,http://127.0.0.1:4321
+HEMIS_PORT=8080
+HEMIS_GEMINI_MODEL=gemini-2.5-flash-lite
+HEMIS_FRONTEND_ORIGINS=https://css.jonathanbello.com,http://localhost:4321,http://127.0.0.1:4321
 ```
 
-> `GEMINI_MODEL` es opcional; por defecto usa `gemini-2.5-flash-lite`.
-> `GEMINI_API_KEY` ya no es requerida para la demo web: el juego envia la key del jugador en el header `X-Emis-Api-Key`.
+Aliases legacy aceptados:
 
-### Instalar y correr
+```env
+EMIS_PORT=8080
+EMIS_GEMINI_MODEL=gemini-2.5-flash-lite
+EMIS_FRONTEND_ORIGINS=http://localhost:4321
+```
 
-```bash
+Tambien se aceptan `PORT`, `GEMINI_MODEL`, `FRONTEND_ORIGINS` y `GEMINI_API_KEY` por compatibilidad.
+
+## Desarrollo local
+
+```sh
 npm install
-npm start
+npm run dev
 ```
 
-El servidor inicia en `http://localhost:8080` (o el `PORT` que definas).
+Prueba de salud:
 
-## 3) Endpoints
-
-### `GET /health`
-
-#### Respuesta esperada
-
-```json
-{
-  "ok": true,
-  "service": "emis-backend"
-}
+```sh
+curl http://localhost:8080/health
 ```
 
----
+Prueba de chat canonico:
 
-### `POST /api/emis/chat`
-
-#### Request body
-
-```json
-{
-  "conversation_id": "conv_abc123",
-  "message": "No logro centrar mi botón",
-  "intent_mode": "auto",
-  "player_context": {
-    "screen": "world_map",
-    "level": "nivel_2",
-    "objective": "activar portal al dojo",
-    "unlocked_css": ["display", "flex"],
-    "zone_id": "zone_campus_north",
-    "quest_id": "quest_portal_bootstrap",
-    "quest_step": "step_2_find_mentor",
-    "nearby_npcs": ["npc_lina", "npc_guardian"],
-    "available_portals": ["portal_1", "portal_2"],
-    "inventory_tags": ["css_scroll", "portal_key"],
-    "failed_attempts_css": ["flex_direction_invalid", "missing_display_flex"]
-  },
-  "css_snapshot_fragment": ".bullet { display:block; margin-left: 12px; }"
-}
+```sh
+curl -s -X POST http://localhost:8080/api/hemis/chat \
+  -H "Content-Type: application/json" \
+  -H "X-Hemis-Api-Key: tu_api_key_gemini" \
+  -d '{
+    "message": "Como uso fill para una bala roja?",
+    "chat_surface": "bullet_creator",
+    "intent_mode": "auto",
+    "player_context": {
+      "level": "tutorial_cave",
+      "objective": "Crear municion CSS con fill"
+    },
+    "css_snapshot": "#shape { fill: red; }"
+  }'
 ```
 
-#### Campos importantes
+Prueba de alias legacy:
 
-- `message` (string, requerido): pregunta del jugador.
-- `intent_mode` (opcional): `tutor_css`, `guia_juego` o `auto`.
-- `conversation_id` (opcional):
-  - si lo envías, preservas memoria conversacional;
-  - si no, el backend genera uno.
-- `player_context` (opcional pero recomendado): estado del juego y progreso.
-- `css_snapshot_fragment` (opcional recomendado): CSS actual para diagnóstico.
-- `css_snapshot` (opcional legacy): compatibilidad con clientes anteriores.
-
-#### Reglas de validación relevantes
-
-- `message`: 1 a 1200 caracteres.
-- `css_snapshot_fragment` / `css_snapshot`: máximo 10000 caracteres.
-- `conversation_id`: máximo 120 caracteres.
-- Arreglos de contexto limitados (por ejemplo `nearby_npcs` máx. 20 elementos).
-
-Si el payload es inválido, responde HTTP `400` con:
-
-```json
-{
-  "ok": false,
-  "error": "Payload inválido",
-  "details": {}
-}
-```
-
-#### Respuesta base
-
-```json
-{
-  "ok": true,
-  "reply": "texto para jugador",
-  "conversation_id": "conv_abc123",
-  "mode_used": "tutor_css",
-  "suggested_action_code": "FOLLOW_GUIDANCE",
-  "follow_up_question": null
-}
-```
-
-#### Comportamientos especiales
-
-1. **Jailbreak detectado en input**
-   - Devuelve respuesta neutral segura.
-   - `mode_used: "security_neutral"`.
-
-2. **Falta contexto mínimo en `guia_juego`**
-   - Si faltan `quest_id` o `quest_step`, pide aclaración puntual.
-   - `suggested_action_code: "PROVIDE_QUEST_CONTEXT"`.
-
-3. **Presupuesto de tokens agotado**
-   - Entra en modo ultra breve.
-   - `mode_used: "ultra_brief_budget"`.
-
-4. **Falla de modelo remoto / error interno**
-   - No rompe al cliente.
-   - Responde `ok: true` con `mode_used: "local_fallback"`.
-
-## 4) Ejemplo rápido para probarla (curl)
-
-### Paso A: salud del servicio
-
-```bash
-curl -s http://localhost:8080/health | jq
-```
-
-### Paso B: chat con contexto de juego + CSS
-
-```bash
+```sh
 curl -s -X POST http://localhost:8080/api/emis/chat \
   -H "Content-Type: application/json" \
   -H "X-Emis-Api-Key: tu_api_key_gemini" \
-  -d '{
-    "conversation_id": "conv_demo_001",
-    "message": "No logro centrar el boton de jugar",
-    "intent_mode": "auto",
-    "player_context": {
-      "screen": "bullet_creator",
-      "level": "nivel_2",
-      "objective": "crear bala con mas daño",
-      "quest_id": "quest_portal_bootstrap",
-      "quest_step": "step_2_find_mentor",
-      "unlocked_css": ["display", "flex"]
-    },
-    "css_snapshot_fragment": ".container{display:block;} .btn-play{margin-left:20px;}"
-  }' | jq
+  -d '{"message":"hola","chat_surface":"general_chat"}'
 ```
 
-### Resultado esperado
+## Funcionamiento
 
-Recibirás JSON con estos campos:
-- `reply`: respuesta para el jugador.
-- `mode_used`: modo aplicado (`tutor_css` o `guia_juego`, etc.).
-- `suggested_action_code`: CTA para UI.
-- `follow_up_question`: pregunta corta si falta contexto.
+- Valida payloads con `zod`.
+- Comprime contexto del jugador para reducir tokens.
+- Cambia entre modo tutor CSS y guia de juego.
+- Aplica filtros de seguridad para evitar prompt injection y fugas de prompt.
+- Registra metricas de conversacion y eventos de seguridad.
+- Usa fallback local cuando el modelo remoto falla.
 
-## 5) Recomendaciones de integración (Godot o cliente propio)
+## Alcance tecnico actual
 
-- Mantén fijo `conversation_id` durante una sesión para conservar contexto.
-- Envía `player_context` en cada turno para mejorar precisión de guía.
-- Envía `css_snapshot_fragment` con el bloque más relevante, no toda la hoja completa.
-- Si `follow_up_question` viene con texto, muéstrala tal cual en UI para completar contexto faltante.
+- Parser CSS propio en el juego Godot.
+- Hemis como tutor/evaluador conectado al backend.
+- Wallace CSS queda documentado como posibilidad futura, no como componente activo del prototipo.
+- Datos de evaluacion educativa simulados pertenecen a la tesis/documentacion, no a este servicio.
